@@ -368,7 +368,7 @@ class DistributedBenchController(object):
             source_object_numbers = 1
         target_object_numbers = self.num_objects
 
-        self.logger.info('%.2f%% (%d out of %d) objects are duplicates',
+        self.logger.info('%.2f%% (%d out of %d) total objects are duplicates',
                          100 * (float(target_object_numbers - source_object_numbers) / target_object_numbers),
                          target_object_numbers - source_object_numbers, target_object_numbers)
 
@@ -441,7 +441,7 @@ class BenchController(object):
                 unique_names.add(object_name)
 
         # report duplicate if not running from swift-bench-client
-        if not isinstance(self.conf, Values):
+        if 'bench_clients' in str(self.conf):
             self.logger.info('%.2f%% (%d out of %d) objects are duplicates',
                              100 * (float(len(self.names) - len(unique_names)) / len(self.names)),
                              len(self.names) - len(unique_names), len(self.names))
