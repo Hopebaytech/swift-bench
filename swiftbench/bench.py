@@ -24,6 +24,7 @@ import socket
 import logging
 from contextlib import contextmanager
 from optparse import Values
+import hashlib
 
 import eventlet
 import eventlet.pools
@@ -113,6 +114,9 @@ class SourceFile(object):
         chunk_size = min(self.size - self.pos, desired_size)
         self.pos += chunk_size
         return '0' * chunk_size
+
+    def seek(self, pos):
+        self.pos = pos
 
 
 class ConnectionPool(eventlet.pools.Pool):
@@ -238,14 +242,19 @@ class Bench(object):
                                         max(self.put_concurrency,
                                             self.get_concurrency,
                                             self.del_concurrency))
+        self.object_files = conf.object_files
+        if self.object_files:
+            self.object_files = self.object_files.split()
+        self.checksum = config_true_value(conf.checksum)
 
     def _log_status(self, title):
         total = time.time() - self.beginbeat
         self.logger.info(
-            '%(complete)s %(title)s [%(fail)s failures], %(rate).01f/s',
+            '%(complete)s %(title)s [%(fail)s failures], %(rate).01f op/s, %(throughput).02f MB/s',
             {'title': title, 'complete': self.complete,
              'fail': self.failures,
-             'rate': (float(self.complete) / total)})
+             'rate': (float(self.complete) / total),
+             'throughput': (float(self.total_mb) / total)},)
 
     @contextmanager
     def connection(self):
@@ -270,6 +279,7 @@ class Bench(object):
         self.heartbeat -= 13    # just to get the first report quicker
         self.failures = 0
         self.complete = 0
+        self.total_mb = 0
         for i in xrange(self.total):
             if self.aborted:
                 break
@@ -311,8 +321,9 @@ class DistributedBenchController(object):
         self.logger = logger
         # ... INFO 1000 PUTS **FINAL** [0 failures], 34.9/s
         self.final_re = re.compile(
-            'INFO (\d+) (.*) \*\*FINAL\*\* \[(\d+) failures\], (\d+\.\d+)/s')
+            'INFO (\d+) (.*) \*\*FINAL\*\* \[(\d+) failures\], (\d+\.\d+) op/s, (\d+\.\d+) MB/s')
         self.clients = conf.bench_clients
+        self.num_objects = int(conf.num_objects)
         del conf.bench_clients
         for key, minval in [('put_concurrency', 1),
                             ('get_concurrency', 1),
@@ -330,9 +341,9 @@ class DistributedBenchController(object):
         for c in self.clients:
             pile.spawn(self.do_run, c)
         results = {
-            'PUTS': dict(count=0, failures=0, rate=0.0),
-            'GETS': dict(count=0, failures=0, rate=0.0),
-            'DEL': dict(count=0, failures=0, rate=0.0),
+            'PUTS': dict(count=0, failures=0, rate=0.0, throughput=0.0),
+            'GETS': dict(count=0, failures=0, rate=0.0, throughput=0.0),
+            'DEL': dict(count=0, failures=0, rate=0.0, throughput=0.0),
         }
         for result in pile:
             for k, v in result.iteritems():
@@ -340,10 +351,26 @@ class DistributedBenchController(object):
                 target['count'] += int(v['count'])
                 target['failures'] += int(v['failures'])
                 target['rate'] += float(v['rate'])
+                target['throughput'] += float(v['throughput'])
         for k in ['PUTS', 'GETS', 'DEL']:
             v = results[k]
-            self.logger.info('%d %s **FINAL** [%d failures], %.1f/s' % (
-                v['count'], k, v['failures'], v['rate']))
+            self.logger.info('%d %s **FINAL** [%d failures], %.1f op/s %.2f MB/s' % (
+                v['count'], k, v['failures'], v['rate'], v['throughput']),)
+
+        # calculate duplicates
+        if self.conf.object_files:
+            source_object_numbers = len(self.conf.object_files.split())
+        elif self.conf.object_sources:
+            source_object_numbers = 0
+        elif int(self.conf.upper_object_size) > int(self.conf.lower_object_size):
+            source_object_numbers = int(self.conf.upper_object_size) - int(self.conf.lower_object_size) + 1
+        else:
+            source_object_numbers = 1
+        target_object_numbers = self.num_objects
+
+        self.logger.info('%.2f%% (%d out of %d) objects are duplicates',
+                         100 * (float(target_object_numbers - source_object_numbers) / target_object_numbers),
+                         target_object_numbers - source_object_numbers, target_object_numbers)
 
     def do_run(self, client):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -361,6 +388,7 @@ class DistributedBenchController(object):
                     'count': g[0],
                     'failures': g[2],
                     'rate': g[3],
+                    'throughput': g[4],
                 }
             else:
                 sys.stderr.write('%s %s' % (client, line))
@@ -403,6 +431,38 @@ class BenchController(object):
             gets = BenchGET(self.logger, self.conf, self.names)
             self.running = gets
             gets.run()
+
+        # calculate duplicate files percentage based on object name
+        unique_names = set()
+        for object_info in self.names:
+            # tuple(device, partition, name, container_name)
+            object_name = object_info[2].rsplit('-', 1)[0]
+            if object_name not in unique_names:
+                unique_names.add(object_name)
+
+        # report duplicate if not running from swift-bench-client
+        if not isinstance(self.conf, Values):
+            self.logger.info('%.2f%% (%d out of %d) objects are duplicates',
+                             100 * (float(len(self.names) - len(unique_names)) / len(self.names)),
+                             len(self.names) - len(unique_names), len(self.names))
+        # running by swift-bench-client, we can't calculate names across all clients
+        # we adjust warn if there is any file that didn't choose by random.choice()
+        else:
+            uploaded_object_numbers = len(unique_names)
+            if self.conf.object_files:
+                source_object_numbers = len(self.conf.object_files.split())
+            elif self.conf.object_sources:
+                source_object_numbers = 0
+            elif int(self.conf.upper_object_size) > int(self.conf.lower_object_size):
+                source_object_numbers = int(self.conf.upper_object_size) - int(self.conf.lower_object_size) + 1
+            else:
+                source_object_numbers = 1
+
+            if source_object_numbers > uploaded_object_numbers:
+                self.logger.warn('This client only PUT %d objects out of %d candidates. '
+                                 'Reported duplicate percentage later will be inaccurate! '
+                                 'Please try to increase num_objects.', uploaded_object_numbers, source_object_numbers)
+
         if self.delete:
             if self.delay != 0:
                 self.logger.info('Delay before '
@@ -459,13 +519,21 @@ class BenchGET(Bench):
         with self.connection() as conn:
             try:
                 if self.use_proxy:
-                    client.get_object(self.url, self.token,
-                                      container_name, name, http_conn=conn)
+                    res_headers, res_content = client.get_object(self.url, self.token,
+                                                                 container_name, name, http_conn=conn)
                 else:
                     node = {'ip': self.ip, 'port': self.port, 'device': device}
-                    direct_client.direct_get_object(node, partition,
-                                                    self.account,
-                                                    container_name, name)
+                    res_headers, res_content = direct_client.direct_get_object(node, partition,
+                                                                               self.account,
+                                                                               container_name, name)
+
+                if self.checksum:
+                    sha256sum = hashlib.sha256(res_content).hexdigest()
+                    digest = name.split('-')[-1]
+                    if digest != sha256sum:
+                        self.logger.warn('Object: %s hash mismatch !', name)
+
+                self.total_mb += (float(sys.getsizeof(res_content)) / 1048576)
             except client.ClientException as e:
                 self.logger.debug(str(e))
                 self.failures += 1
@@ -486,13 +554,28 @@ class BenchPUT(Bench):
             self.heartbeat = time.time()
             self._log_status('PUTS')
         name = uuid.uuid4().hex
-        if self.object_sources:
+        if self.object_files:
+            source = open(random.choice(self.object_files), 'rb')
+            name = '{}-{}'.format(source.name.split('/')[-1], name)
+        elif self.object_sources:
             source = random.choice(self.files)
         elif self.upper_object_size > self.lower_object_size:
             source = SourceFile(random.randint(self.lower_object_size,
                                                self.upper_object_size))
+            name = '{}-{}'.format(len(source), name)
         else:
             source = SourceFile(self.object_size)
+            name = '{}-{}'.format(len(source), name)
+
+        if self.checksum:
+            if isinstance(source, file):
+                sha256sum = hashlib.sha256(source.read()).hexdigest()
+                source.seek(0)
+            else:
+                sha256sum = hashlib.sha256(source.read(len(source))).hexdigest()
+                source.seek(0)
+            name = '{}-{}'.format(name, sha256sum)
+
         device = random.choice(self.devices)
         partition = str(random.randint(1, 3000))
         container_name = random.choice(self.containers)
@@ -501,7 +584,7 @@ class BenchPUT(Bench):
                 if self.use_proxy:
                     client.put_object(self.url, self.token,
                                       container_name, name, source,
-                                      content_length=len(source),
+                                      content_length=len(source) if not isinstance(source, file) else None,
                                       http_conn=conn)
                 else:
                     node = {'ip': self.ip, 'port': self.port, 'device': device}
@@ -509,10 +592,16 @@ class BenchPUT(Bench):
                                                     self.account,
                                                     container_name, name,
                                                     source,
-                                                    content_length=len(source))
+                                                    content_length=len(source) if not isinstance(source, file) else None)
             except client.ClientException as e:
                 self.logger.debug(str(e))
                 self.failures += 1
             else:
                 self.names.append((device, partition, name, container_name))
+        if isinstance(source, file):
+            # assume file had seek to the end
+            self.total_mb += (float(source.tell()) / 1048576)
+            source.close()
+        else:
+            self.total_mb += (float(len(source)) / 1048576)
         self.complete += 1

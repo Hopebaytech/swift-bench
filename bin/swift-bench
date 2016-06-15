@@ -52,6 +52,8 @@ CONF_DEFAULTS = {
     'timeout': '10',
     'delay': '0',
     'bench_clients': [],
+    'object_files': '',
+    'checksum': 'no',
 }
 
 SAIO_DEFAULTS = {
@@ -143,7 +145,7 @@ if __name__ == '__main__':
             sys.exit("No such conf file: %s" % conf)
         conf = readconf(conf, 'bench', log_name='swift-bench',
                         defaults=CONF_DEFAULTS)
-        conf['bench_clients'] = []
+        conf['bench_clients'] = conf['bench_clients'].split()
     else:
         conf = CONF_DEFAULTS
     parser.set_defaults(**conf)
