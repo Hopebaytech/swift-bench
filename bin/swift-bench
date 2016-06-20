@@ -54,6 +54,7 @@ CONF_DEFAULTS = {
     'bench_clients': [],
     'object_files': '',
     'checksum': 'no',
+    'insecure': 'yes'
 }
 
 SAIO_DEFAULTS = {
@@ -155,7 +156,7 @@ if __name__ == '__main__':
         options.put_concurrency = options.concurrency
         options.get_concurrency = options.concurrency
         options.del_concurrency = options.concurrency
-    options.containers = ['%s_%d' % (options.container_name, i)
+    options.containers = ['%s_%s_%d' % (options.container_name, options.user, i)
                           for i in xrange(int(options.num_containers))]
 
     # Turn "yes"/"no"/etc. strings to booleans
@@ -181,6 +182,7 @@ if __name__ == '__main__':
         'swift-bench %(asctime)s %(levelname)s %(message)s')
     loghandler.setFormatter(logformat)
 
+    options.insecure = config_true_value(options.insecure)
     if options.use_proxy:
         create_containers(logger, options)
 

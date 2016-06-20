@@ -43,6 +43,12 @@ except ImportError:
 HTTP_CONFLICT = 409
 
 
+# Disable InsecureRequestWarning in requests package
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
 def _func_on_containers(logger, conf, concurrency_key, func, **kwargs):
     """Run a function on each container with concurrency."""
 
@@ -58,7 +64,8 @@ def delete_containers(logger, conf):
 
     def _deleter(url, token, container):
         try:
-            client.delete_container(url, token, container)
+            http_conn = client.http_connection(url, insecure=True)
+            client.delete_container(url, token, container, http_conn=http_conn)
         except client.ClientException as e:
             if e.http_status != HTTP_CONFLICT:
                 logger.warn("Unable to delete container '%s'. "
@@ -71,15 +78,19 @@ def delete_containers(logger, conf):
 def create_containers(logger, conf):
     """Utility function to create benchmark containers."""
 
+    def _creater(url, token, container):
+        http_conn = client.http_connection(url, insecure=True)
+        client.put_container(url, token, container, http_conn=http_conn)
+
     if conf.policy_name:
         logger.info("Creating containers with storage policy: %s" %
                     conf.policy_name)
         _func_on_containers(logger, conf, 'put_concurrency',
-                            client.put_container,
+                            _creater,
                             headers={'X-Storage-Policy': conf.policy_name})
     else:
         _func_on_containers(logger, conf, 'put_concurrency',
-                            client.put_container)
+                            _creater)
 
 
 class SourceFile(object):
@@ -126,7 +137,7 @@ class ConnectionPool(eventlet.pools.Pool):
         eventlet.pools.Pool.__init__(self, size, size)
 
     def create(self):
-        return client.http_connection(self.url)
+        return client.http_connection(self.url, insecure=True)
 
 
 class BenchServer(object):
@@ -204,7 +215,8 @@ class Bench(object):
                 logger.warn("Auth is going through HTTP proxy server. This "
                             "could affect test result")
             url, token = client.get_auth(self.auth_url, self.user, self.key,
-                                         auth_version=self.auth_version)
+                                         auth_version=self.auth_version,
+                                         insecure=conf.insecure)
             self.token = token
             self.account = url.split('/')[-1]
             if conf.url == '':
