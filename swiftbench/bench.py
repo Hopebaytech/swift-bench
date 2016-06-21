@@ -43,10 +43,14 @@ except ImportError:
 HTTP_CONFLICT = 409
 
 
-# Disable InsecureRequestWarning in requests package
+# Disable urllib3 ssl related warnings in requests package
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from requests.packages.urllib3.exceptions import InsecurePlatformWarning
+from requests.packages.urllib3.exceptions import SNIMissingWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+requests.packages.urllib3.disable_warnings(InsecurePlatformWarning)
+requests.packages.urllib3.disable_warnings(SNIMissingWarning)
 
 
 def _func_on_containers(logger, conf, concurrency_key, func, **kwargs):
