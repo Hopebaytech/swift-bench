@@ -421,6 +421,7 @@ class BenchController(object):
         self.gets = int(conf.num_gets)
         self.aborted = False
         self.delay = int(self.conf.delay)
+        self.checksum = config_true_value(conf.checksum)
 
     def sigint1(self, signum, frame):
         if self.delete:
@@ -452,7 +453,8 @@ class BenchController(object):
         unique_names = set()
         for object_info in self.names:
             # tuple(device, partition, name, container_name)
-            object_name = object_info[2].rsplit('-', 1)[0]
+            split_max = 2 if self.checksum else 1
+            object_name = object_info[2].rsplit('-', split_max)[0]
             if object_name not in unique_names:
                 unique_names.add(object_name)
 
