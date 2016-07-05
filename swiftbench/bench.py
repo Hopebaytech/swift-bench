@@ -244,7 +244,6 @@ class Bench(object):
         self.files = []
         if self.object_sources:
             self.object_sources = self.object_sources.split()
-            self.files = [file(f, 'rb').read() for f in self.object_sources]
 
         self.put_concurrency = int(conf.put_concurrency)
         self.get_concurrency = int(conf.get_concurrency)
@@ -377,7 +376,7 @@ class DistributedBenchController(object):
         if self.conf.object_files:
             source_object_numbers = len(self.conf.object_files.split())
         elif self.conf.object_sources:
-            source_object_numbers = 0
+            source_object_numbers = len(self.conf.object_sources.split())
         elif int(self.conf.upper_object_size) > int(self.conf.lower_object_size):
             source_object_numbers = int(self.conf.upper_object_size) - int(self.conf.lower_object_size) + 1
         else:
@@ -470,7 +469,7 @@ class BenchController(object):
             if self.conf.object_files:
                 source_object_numbers = len(self.conf.object_files.split())
             elif self.conf.object_sources:
-                source_object_numbers = 0
+                source_object_numbers = len(self.conf.object_sources.split())
             elif int(self.conf.upper_object_size) > int(self.conf.lower_object_size):
                 source_object_numbers = int(self.conf.upper_object_size) - int(self.conf.lower_object_size) + 1
             else:
@@ -533,6 +532,7 @@ class BenchGET(Bench):
         if time.time() - self.heartbeat >= 15:
             self.heartbeat = time.time()
             self._log_status('GETS')
+
         device, partition, name, container_name = random.choice(self.names)
         with self.connection() as conn:
             try:
@@ -576,7 +576,9 @@ class BenchPUT(Bench):
             source = open(random.choice(self.object_files), 'rb')
             name = '{}-{}'.format(source.name.split('/')[-1], name)
         elif self.object_sources:
-            source = random.choice(self.files)
+            f = random.choice(self.object_sources)
+            source = file(f, 'rb').read()
+            name = '{}-{}'.format(f.split('/')[-1], name)
         elif self.upper_object_size > self.lower_object_size:
             source = SourceFile(random.randint(self.lower_object_size,
                                                self.upper_object_size))
@@ -589,6 +591,8 @@ class BenchPUT(Bench):
             if isinstance(source, file):
                 sha256sum = hashlib.sha256(source.read()).hexdigest()
                 source.seek(0)
+            elif isinstance(source, str):
+                sha256sum = hashlib.sha256(source).hexdigest()
             else:
                 sha256sum = hashlib.sha256(source.read(len(source))).hexdigest()
                 source.seek(0)
