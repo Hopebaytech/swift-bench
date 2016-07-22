@@ -136,12 +136,13 @@ class SourceFile(object):
 
 class ConnectionPool(eventlet.pools.Pool):
 
-    def __init__(self, url, size):
+    def __init__(self, url, size, timeout=None):
         self.url = url
+        self.timeout = timeout
         eventlet.pools.Pool.__init__(self, size, size)
 
     def create(self):
-        return client.http_connection(self.url, insecure=True)
+        return client.http_connection(self.url, insecure=True, timeout=self.timeout)
 
 
 class BenchServer(object):
@@ -256,7 +257,7 @@ class Bench(object):
         self.conn_pool = ConnectionPool(self.url,
                                         max(self.put_concurrency,
                                             self.get_concurrency,
-                                            self.del_concurrency))
+                                            self.del_concurrency), self.timeout)
         self.object_files = conf.object_files
         if self.object_files:
             self.object_files = self.object_files.split()
