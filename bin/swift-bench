@@ -54,7 +54,8 @@ CONF_DEFAULTS = {
     'bench_clients': [],
     'object_files': '',
     'checksum': 'no',
-    'insecure': 'yes'
+    'insecure': 'yes',
+    'num_req_per_stream': '1'
 }
 
 SAIO_DEFAULTS = {

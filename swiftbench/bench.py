@@ -34,6 +34,8 @@ import swiftclient as client
 
 from swiftbench.utils import config_true_value, using_http_proxy
 
+from urlparse import urlparse
+from hyper import HTTPConnection
 
 try:
     from swift.common import direct_client
@@ -262,6 +264,8 @@ class Bench(object):
         if self.object_files:
             self.object_files = self.object_files.split()
         self.checksum = config_true_value(conf.checksum)
+
+        self.num_req_per_stream = int(conf.num_req_per_stream)
 
     def _log_status(self, title):
         total = time.time() - self.beginbeat
@@ -526,7 +530,9 @@ class BenchGET(Bench):
     def __init__(self, logger, conf, names):
         Bench.__init__(self, logger, conf, names)
         self.concurrency = self.get_concurrency
-        self.total = self.total_gets
+        if self.total_gets < self.num_req_per_stream:
+            self.num_req_per_stream = self.total_gets
+        self.total = self.total_gets / self.num_req_per_stream
         self.msg = 'GETS'
 
     def _run(self, thread):
@@ -534,29 +540,52 @@ class BenchGET(Bench):
             self.heartbeat = time.time()
             self._log_status('GETS')
 
-        device, partition, name, container_name = random.choice(self.names)
         with self.connection() as conn:
-            try:
-                if self.use_proxy:
-                    res_headers, res_content = client.get_object(self.url, self.token,
-                                                                 container_name, name, http_conn=conn)
-                else:
-                    node = {'ip': self.ip, 'port': self.port, 'device': device}
-                    res_headers, res_content = direct_client.direct_get_object(node, partition,
-                                                                               self.account,
-                                                                               container_name, name)
+            parsed_url = urlparse(self.url)
+            c = HTTPConnection('{uri.netloc}'.format(uri=parsed_url), secure=True)
+            req_list = []
 
-                if self.checksum:
-                    sha256sum = hashlib.sha256(res_content).hexdigest()
-                    digest = name.split('-')[-1]
-                    if digest != sha256sum:
-                        self.logger.warn('Object: %s hash mismatch !', name)
+            for _ in range(self.num_req_per_stream):
+                device, partition, name, container_name = random.choice(self.names)
+                try:
+                    if self.use_proxy:
+                        req_id = c.request('GET', '{uri.path}/{container}/{object}'.format(uri=parsed_url, container=container_name, object=name),
+                                           body=None, headers={'X-Auth-Token': self.token})
 
-                self.total_mb += (float(sys.getsizeof(res_content)) / 1048576)
-            except client.ClientException as e:
-                self.logger.debug(str(e))
-                self.failures += 1
-        self.complete += 1
+                        req_list.append({'req_id': req_id, 'name': name})
+                    else:
+                        node = {'ip': self.ip, 'port': self.port, 'device': device}
+                        res_headers, res_content = direct_client.direct_get_object(node, partition,
+                                                                                   self.account,
+                                                                                   container_name, name)
+                        req_list.append({'req_id': None, 'name': name, 'content': res_content})
+
+                except client.ClientException as e:
+                    self.logger.debug(str(e))
+                    self.failures += 1
+
+            for _ in range(self.num_req_per_stream):
+                req_item = req_list.pop(0)
+                try:
+                    if self.use_proxy:
+                        rep = c.get_response(req_item['req_id'])
+                        res_content = rep.read()
+                    else:
+                        res_content = req_item['content']
+
+                    if self.checksum:
+                        name = req_item['name']
+                        sha256sum = hashlib.sha256(res_content).hexdigest()
+                        digest = name.split('-')[-1]
+                        if digest != sha256sum:
+                            self.logger.warn('Object: %s hash mismatch !', name)
+
+                    self.total_mb += (float(sys.getsizeof(res_content)) / 1048576)
+                except client.ClientException as e:
+                    self.logger.debug(str(e))
+                    self.failures += 1
+
+        self.complete += self.num_req_per_stream
 
 
 class BenchPUT(Bench):
@@ -564,7 +593,9 @@ class BenchPUT(Bench):
     def __init__(self, logger, conf, names):
         Bench.__init__(self, logger, conf, names)
         self.concurrency = self.put_concurrency
-        self.total = self.total_objects
+        if self.total_objects < self.num_req_per_stream:
+            self.num_req_per_stream = self.total_objects
+        self.total = self.total_objects / self.num_req_per_stream
         self.msg = 'PUTS'
         self.containers = conf.containers
 
@@ -572,59 +603,74 @@ class BenchPUT(Bench):
         if time.time() - self.heartbeat >= 15:
             self.heartbeat = time.time()
             self._log_status('PUTS')
-        name = uuid.uuid4().hex
-        if self.object_files:
-            source = open(random.choice(self.object_files), 'rb')
-            name = '{}-{}'.format(source.name.split('/')[-1], name)
-        elif self.object_sources:
-            f = random.choice(self.object_sources)
-            source = file(f, 'rb').read()
-            name = '{}-{}'.format(f.split('/')[-1], name)
-        elif self.upper_object_size > self.lower_object_size:
-            source = SourceFile(random.randint(self.lower_object_size,
-                                               self.upper_object_size))
-            name = '{}-{}'.format(len(source), name)
-        else:
-            source = SourceFile(self.object_size)
-            name = '{}-{}'.format(len(source), name)
 
-        if self.checksum:
-            if isinstance(source, file):
-                sha256sum = hashlib.sha256(source.read()).hexdigest()
-                source.seek(0)
-            elif isinstance(source, str):
-                sha256sum = hashlib.sha256(source).hexdigest()
-            else:
-                sha256sum = hashlib.sha256(source.read(len(source))).hexdigest()
-                source.seek(0)
-            name = '{}-{}'.format(name, sha256sum)
-
-        device = random.choice(self.devices)
-        partition = str(random.randint(1, 3000))
-        container_name = random.choice(self.containers)
         with self.connection() as conn:
-            try:
-                if self.use_proxy:
-                    client.put_object(self.url, self.token,
-                                      container_name, name, source,
-                                      content_length=len(source) if not isinstance(source, file) else None,
-                                      http_conn=conn)
+            parsed_url = urlparse(self.url)
+            c = HTTPConnection('{uri.netloc}'.format(uri=parsed_url), secure=True)
+            req_list = []
+
+            for _ in range(self.num_req_per_stream):
+                name = uuid.uuid4().hex
+                if self.object_files:
+                    source = open(random.choice(self.object_files), 'rb')
+                    name = '{}-{}'.format(source.name.split('/')[-1], name)
+                elif self.object_sources:
+                    f = random.choice(self.object_sources)
+                    source = file(f, 'rb').read()
+                    name = '{}-{}'.format(f.split('/')[-1], name)
+                elif self.upper_object_size > self.lower_object_size:
+                    source = SourceFile(random.randint(self.lower_object_size,
+                                                       self.upper_object_size))
+                    name = '{}-{}'.format(len(source), name)
                 else:
-                    node = {'ip': self.ip, 'port': self.port, 'device': device}
-                    direct_client.direct_put_object(node, partition,
-                                                    self.account,
-                                                    container_name, name,
-                                                    source,
-                                                    content_length=len(source) if not isinstance(source, file) else None)
-            except client.ClientException as e:
-                self.logger.debug(str(e))
-                self.failures += 1
-            else:
-                self.names.append((device, partition, name, container_name))
-        if isinstance(source, file):
-            # assume file had seek to the end
-            self.total_mb += (float(source.tell()) / 1048576)
-            source.close()
-        else:
-            self.total_mb += (float(len(source)) / 1048576)
-        self.complete += 1
+                    source = SourceFile(self.object_size)
+                    name = '{}-{}'.format(len(source), name)
+
+                if self.checksum:
+                    if isinstance(source, file):
+                        sha256sum = hashlib.sha256(source.read()).hexdigest()
+                        source.seek(0)
+                    elif isinstance(source, str):
+                        sha256sum = hashlib.sha256(source).hexdigest()
+                    else:
+                        sha256sum = hashlib.sha256(source.read(len(source))).hexdigest()
+                        source.seek(0)
+                    name = '{}-{}'.format(name, sha256sum)
+
+                device = random.choice(self.devices)
+                partition = str(random.randint(1, 3000))
+                container_name = random.choice(self.containers)
+
+                try:
+                    if self.use_proxy:
+                        req_id = c.request('PUT', '{uri.path}/{container}/{object}'.format(uri=parsed_url, container=container_name, object=name),
+                                           body=source, headers={'X-Auth-Token': self.token})
+
+                        req_list.append({'req_id': req_id, 'name': name})
+                    else:
+                        node = {'ip': self.ip, 'port': self.port, 'device': device}
+                        direct_client.direct_put_object(node, partition,
+                                                        self.account,
+                                                        container_name, name,
+                                                        source,
+                                                        content_length=len(source) if not isinstance(source, file) else None)
+                except client.ClientException as e:
+                    self.logger.debug(str(e))
+                    self.failures += 1
+                else:
+                    self.names.append((device, partition, name, container_name))
+
+                if isinstance(source, file):
+                    # assume file had seek to the end
+                    self.total_mb += (float(source.tell()) / 1048576)
+                    source.close()
+                else:
+                    self.total_mb += (float(len(source)) / 1048576)
+
+            for _ in range(self.num_req_per_stream):
+                req_item = req_list.pop(0)
+                if self.use_proxy:
+                    rep = c.get_response(req_item['req_id'])
+                    rep.read()
+
+            self.complete += self.num_req_per_stream
