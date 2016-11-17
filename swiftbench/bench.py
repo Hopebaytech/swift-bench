@@ -25,6 +25,8 @@ import logging
 from contextlib import contextmanager
 from optparse import Values
 import hashlib
+import multiprocessing
+import os
 
 import eventlet
 import eventlet.pools
@@ -33,7 +35,6 @@ from eventlet.green.httplib import CannotSendRequest
 import swiftclient as client
 
 from swiftbench.utils import config_true_value, using_http_proxy
-
 
 try:
     from swift.common import direct_client
@@ -107,10 +108,11 @@ class SourceFile(object):
     this class can do both.
     """
 
-    def __init__(self, size, chunk_size=1024 * 64):
+    def __init__(self, size, chunk_size=1024 * 64, randomize=False):
         self.pos = 0
         self.size = size
         self.chunk_size = chunk_size
+        self.random = randomize
 
     def __iter__(self):
         return self
@@ -128,7 +130,10 @@ class SourceFile(object):
     def read(self, desired_size):
         chunk_size = min(self.size - self.pos, desired_size)
         self.pos += chunk_size
-        return '0' * chunk_size
+        if self.random:
+            return os.urandom(1) * chunk_size
+        else:
+            return '0' * chunk_size
 
     def seek(self, pos):
         self.pos = pos
@@ -262,6 +267,7 @@ class Bench(object):
         if self.object_files:
             self.object_files = self.object_files.split()
         self.checksum = config_true_value(conf.checksum)
+        self.random = config_true_value(conf.random)
 
     def _log_status(self, title):
         total = time.time() - self.beginbeat
@@ -290,17 +296,37 @@ class Bench(object):
             self.conn_pool.put(hc)
 
     def run(self):
-        pool = eventlet.GreenPool(self.concurrency)
         self.beginbeat = self.heartbeat = time.time()
         self.heartbeat -= 13    # just to get the first report quicker
+
         self.failures = 0
         self.complete = 0
         self.total_mb = 0
-        for i in xrange(self.total):
-            if self.aborted:
-                break
-            pool.spawn_n(self._run, i)
-        pool.waitall()
+
+        mgr = multiprocessing.Manager()
+        results = mgr.dict()
+
+        self.lock = multiprocessing.Lock()
+
+        results['names'] = self.names
+        results['complete'] = 0
+        results['total_mb'] = float(0)
+        results['failures'] = 0
+
+        prcocesses = []
+        for i in range(self.total):
+            p = multiprocessing.Process(target=self._run, name=str(i), args=(results,))
+            prcocesses.append(p)
+        for p in prcocesses:
+            p.start()
+        for p in prcocesses:
+            p.join()
+
+        self.failures = results.get('failures', 0)
+        self.complete = results.get('complete', 0)
+        self.total_mb = results.get('total_mb', float(0))
+        self.names += results.get('names', [])
+
         self._log_status(self.msg + ' **FINAL**')
 
     def _run(self, thread):
@@ -422,6 +448,7 @@ class BenchController(object):
         self.aborted = False
         self.delay = int(self.conf.delay)
         self.checksum = config_true_value(conf.checksum)
+        self.random = config_true_value(conf.random)
 
     def sigint1(self, signum, frame):
         if self.delete:
@@ -439,11 +466,11 @@ class BenchController(object):
         sys.exit('Final SIGINT received.')
 
     def run(self):
-        eventlet.patcher.monkey_patch(socket=True)
         signal.signal(signal.SIGINT, self.sigint1)
         puts = BenchPUT(self.logger, self.conf, self.names)
         self.running = puts
         puts.run()
+
         if self.gets and not self.aborted:
             gets = BenchGET(self.logger, self.conf, self.names)
             self.running = gets
@@ -459,7 +486,7 @@ class BenchController(object):
                 unique_names.add(object_name)
 
         # report duplicate if not running from swift-bench-client
-        if 'bench_clients' in str(self.conf):
+        if 'bench_clients' in str(self.conf) and not self.random:
             self.logger.info('%.2f%% (%d out of %d) objects are duplicates',
                              100 * (float(len(self.names) - len(unique_names)) / len(self.names)),
                              len(self.names) - len(unique_names), len(self.names))
@@ -497,15 +524,34 @@ class BenchDELETE(Bench):
     def __init__(self, logger, conf, names):
         Bench.__init__(self, logger, conf, names)
         self.concurrency = self.del_concurrency
-        self.total = len(names)
+        if len(names) > self.concurrency:
+            self.num_obj_per_process = int(len(names) / self.concurrency)
+        else:
+            self.num_obj_per_process = 1
+        self.total = len(names) / self.num_obj_per_process
         self.msg = 'DEL'
 
     def _run(self, thread):
-        if time.time() - self.heartbeat >= 15:
-            self.heartbeat = time.time()
-            self._log_status('DEL')
-        device, partition, name, container_name = self.names.pop()
-        with self.connection() as conn:
+        conn = client.http_connection(self.url, insecure=True, timeout=self.timeout)
+
+        mid = int(multiprocessing.current_process().name)
+        object_list = thread['names']
+
+        if mid == self.total - 1:
+            num_to_del = len(self.names) - (mid * self.num_obj_per_process)
+        else:
+            num_to_del = self.num_obj_per_process
+
+        for i in range(num_to_del):
+            if time.time() - self.heartbeat >= 5 and mid == 0:
+                self.heartbeat = time.time()
+                # aggregate all other processes's value to log_status
+                self.complete = thread.get('complete', 0)
+                self.failures = thread.get('failures', 0)
+                self._log_status('DEL')
+
+            device, partition, name, container_name = object_list[(mid * self.num_obj_per_process) + i]
+
             try:
                 if self.use_proxy:
                     client.delete_object(self.url, self.token,
@@ -518,7 +564,12 @@ class BenchDELETE(Bench):
             except client.ClientException as e:
                 self.logger.debug(str(e))
                 self.failures += 1
-        self.complete += 1
+                thread['failures'] += 1
+
+            self.lock.acquire()
+            self.complete += 1
+            thread['complete'] = thread.get('complete', 0) + 1
+            self.lock.release()
 
 
 class BenchGET(Bench):
@@ -526,16 +577,37 @@ class BenchGET(Bench):
     def __init__(self, logger, conf, names):
         Bench.__init__(self, logger, conf, names)
         self.concurrency = self.get_concurrency
-        self.total = self.total_gets
+        if self.total_gets > self.concurrency:
+            self.num_obj_per_process = int(self.total_gets / self.concurrency)
+        else:
+            self.num_obj_per_process = 1
+        self.total = self.total_gets / self.num_obj_per_process
         self.msg = 'GETS'
 
     def _run(self, thread):
-        if time.time() - self.heartbeat >= 15:
-            self.heartbeat = time.time()
-            self._log_status('GETS')
+        conn = client.http_connection(self.url, insecure=True, timeout=self.timeout)
 
-        device, partition, name, container_name = random.choice(self.names)
-        with self.connection() as conn:
+        # clear names in manager, so self.names won't get duplicate
+        thread['names'] = []
+
+        mid = int(multiprocessing.current_process().name)
+
+        if mid == self.total - 1:
+            num_to_get = self.total_gets - (mid * self.num_obj_per_process)
+        else:
+            num_to_get = self.num_obj_per_process
+
+        for _ in range(num_to_get):
+            if time.time() - self.heartbeat >= 5 and mid == 0:
+                self.heartbeat = time.time()
+                # aggregate all other processes's value to log_status
+                self.complete = thread.get('complete', 0)
+                self.total_mb = thread.get('total_mb', float(0))
+                self.failures = thread.get('failures', 0)
+                self._log_status('GETS')
+
+            device, partition, name, container_name = random.choice(self.names)
+
             try:
                 if self.use_proxy:
                     res_headers, res_content = client.get_object(self.url, self.token,
@@ -552,11 +624,18 @@ class BenchGET(Bench):
                     if digest != sha256sum:
                         self.logger.warn('Object: %s hash mismatch !', name)
 
-                self.total_mb += (float(sys.getsizeof(res_content)) / 1048576)
             except client.ClientException as e:
                 self.logger.debug(str(e))
                 self.failures += 1
-        self.complete += 1
+                thread['failures'] += 1
+            else:
+                self.total_mb += (float(sys.getsizeof(res_content)) / 1048576)
+                self.complete += 1
+
+                self.lock.acquire()
+                thread['total_mb'] = thread.get('total_mb', float(0)) + (float(sys.getsizeof(res_content)) / 1048576)
+                thread['complete'] = thread.get('complete', 0) + 1
+                self.lock.release()
 
 
 class BenchPUT(Bench):
@@ -564,45 +643,65 @@ class BenchPUT(Bench):
     def __init__(self, logger, conf, names):
         Bench.__init__(self, logger, conf, names)
         self.concurrency = self.put_concurrency
-        self.total = self.total_objects
+        if self.total_objects > self.concurrency:
+            self.num_obj_per_process = int(self.total_objects / self.concurrency)
+        else:
+            self.num_obj_per_process = 1
+        self.total = self.total_objects / self.num_obj_per_process
         self.msg = 'PUTS'
         self.containers = conf.containers
 
     def _run(self, thread):
-        if time.time() - self.heartbeat >= 15:
-            self.heartbeat = time.time()
-            self._log_status('PUTS')
-        name = uuid.uuid4().hex
-        if self.object_files:
-            source = open(random.choice(self.object_files), 'rb')
-            name = '{}-{}'.format(source.name.split('/')[-1], name)
-        elif self.object_sources:
-            f = random.choice(self.object_sources)
-            source = file(f, 'rb').read()
-            name = '{}-{}'.format(f.split('/')[-1], name)
-        elif self.upper_object_size > self.lower_object_size:
-            source = SourceFile(random.randint(self.lower_object_size,
-                                               self.upper_object_size))
-            name = '{}-{}'.format(len(source), name)
+
+        mid = int(multiprocessing.current_process().name)
+
+        if mid == self.total - 1:
+            num_to_put = self.total_objects - (mid * self.num_obj_per_process)
         else:
-            source = SourceFile(self.object_size)
-            name = '{}-{}'.format(len(source), name)
+            num_to_put = self.num_obj_per_process
 
-        if self.checksum:
-            if isinstance(source, file):
-                sha256sum = hashlib.sha256(source.read()).hexdigest()
-                source.seek(0)
-            elif isinstance(source, str):
-                sha256sum = hashlib.sha256(source).hexdigest()
+        conn = client.http_connection(self.url, insecure=True, timeout=self.timeout)
+        for _ in range(num_to_put):
+            if time.time() - self.heartbeat >= 5 and mid == 0:
+                self.heartbeat = time.time()
+
+                # aggregate all other processes's value to log_status
+                self.complete = thread.get('complete', 0)
+                self.total_mb = thread.get('total_mb', float(0))
+                self.failures = thread.get('failures', 0)
+                self._log_status('PUTS')
+
+            name = uuid.uuid4().hex
+            if self.object_files:
+                source = open(random.choice(self.object_files), 'rb')
+                name = '{}-{}'.format(source.name.split('/')[-1], name)
+            elif self.object_sources:
+                f = random.choice(self.object_sources)
+                source = file(f, 'rb').read()
+                name = '{}-{}'.format(f.split('/')[-1], name)
+            elif self.upper_object_size > self.lower_object_size:
+                source = SourceFile(random.randint(self.lower_object_size,
+                                                   self.upper_object_size), randomize=self.random)
+                name = '{}-{}'.format(len(source), name)
             else:
-                sha256sum = hashlib.sha256(source.read(len(source))).hexdigest()
-                source.seek(0)
-            name = '{}-{}'.format(name, sha256sum)
+                source = SourceFile(self.object_size, randomize=self.random)
+                name = '{}-{}'.format(len(source), name)
 
-        device = random.choice(self.devices)
-        partition = str(random.randint(1, 3000))
-        container_name = random.choice(self.containers)
-        with self.connection() as conn:
+            if self.checksum:
+                if isinstance(source, file):
+                    sha256sum = hashlib.sha256(source.read()).hexdigest()
+                    source.seek(0)
+                elif isinstance(source, str):
+                    sha256sum = hashlib.sha256(source).hexdigest()
+                else:
+                    sha256sum = hashlib.sha256(source.read(len(source))).hexdigest()
+                    source.seek(0)
+                name = '{}-{}'.format(name, sha256sum)
+
+            device = random.choice(self.devices)
+            partition = str(random.randint(1, 3000))
+            container_name = random.choice(self.containers)
+
             try:
                 if self.use_proxy:
                     client.put_object(self.url, self.token,
@@ -619,12 +718,24 @@ class BenchPUT(Bench):
             except client.ClientException as e:
                 self.logger.debug(str(e))
                 self.failures += 1
+                thread['failures'] += 1
             else:
                 self.names.append((device, partition, name, container_name))
-        if isinstance(source, file):
-            # assume file had seek to the end
-            self.total_mb += (float(source.tell()) / 1048576)
-            source.close()
-        else:
-            self.total_mb += (float(len(source)) / 1048576)
-        self.complete += 1
+
+            self.lock.acquire()
+            if isinstance(source, file):
+                # assume file had seek to the end
+                self.total_mb += (float(source.tell()) / 1048576)
+                source.close()
+                thread['total_mb'] += (float(source.tell()) / 1048576)
+            else:
+                self.total_mb += (float(len(source)) / 1048576)
+                thread['total_mb'] += (float(len(source)) / 1048576)
+
+            self.complete += 1
+            thread['complete'] += 1
+            self.lock.release()
+
+        self.lock.acquire()
+        thread['names'] += self.names
+        self.lock.release()
