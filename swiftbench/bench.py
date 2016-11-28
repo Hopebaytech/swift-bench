@@ -113,6 +113,7 @@ class SourceFile(object):
         self.size = size
         self.chunk_size = chunk_size
         self.random = randomize
+        self.randomchr = os.urandom(1)
 
     def __iter__(self):
         return self
@@ -125,13 +126,16 @@ class SourceFile(object):
             raise StopIteration
         chunk_size = min(self.size - self.pos, self.chunk_size)
         self.pos += chunk_size
-        return '0' * chunk_size
+        if self.random:
+            return self.randomchr * chunk_size
+        else:
+            return '0' * chunk_size
 
     def read(self, desired_size):
         chunk_size = min(self.size - self.pos, desired_size)
         self.pos += chunk_size
         if self.random:
-            return os.urandom(1) * chunk_size
+            return self.randomchr * chunk_size
         else:
             return '0' * chunk_size
 
